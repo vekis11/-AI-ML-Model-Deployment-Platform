@@ -1,0 +1,105 @@
+# Snyk configuration file
+version: v1.25.0
+
+# Test settings
+test:
+  # Test for vulnerabilities in dependencies
+  dependencies: true
+  
+  # Test for vulnerabilities in code
+  code: true
+  
+  # Test for vulnerabilities in container images
+  container: true
+
+# Monitor settings
+monitor:
+  # Monitor dependencies for new vulnerabilities
+  dependencies: true
+  
+  # Monitor code for new vulnerabilities
+  code: true
+  
+  # Monitor container images for new vulnerabilities
+  container: true
+
+# Policy settings
+policy:
+  # Fail the build if high severity vulnerabilities are found
+  failOn: high
+  
+  # Ignore specific vulnerabilities (add as needed)
+  ignore:
+    # Example: ignore a specific vulnerability
+    # - id: "SNYK-PYTHON-REQUESTS-1062909"
+    #   reason: "False positive in our use case"
+    #   expires: "2024-12-31T23:59:59.000Z"
+
+# Project settings
+project:
+  # Project name
+  name: "ml-platform"
+  
+  # Project environment
+  environment: "development"
+  
+  # Project lifecycle
+  lifecycle: "development"
+
+# Scan settings
+scan:
+  # Include paths to scan
+  include:
+    - "src/**"
+    - "requirements.txt"
+    - "Dockerfile"
+  
+  # Exclude paths from scanning
+  exclude:
+    - "tests/**"
+    - "docs/**"
+    - "*.md"
+    - ".git/**"
+    - "venv/**"
+    - "__pycache__/**"
+
+# Reporting settings
+report:
+  # Generate JSON report
+  json: true
+  
+  # Generate HTML report
+  html: true
+  
+  # Generate SARIF report for GitHub Code Scanning
+  sarif: true
+
+# Container settings
+container:
+  # Base image to scan
+  baseImage: "python:3.8-slim"
+  
+  # Scan for vulnerabilities in base image
+  scanBaseImage: true
+
+# Code analysis settings
+code:
+  # Enable SAST (Static Application Security Testing)
+  sast: true
+  
+  # Enable SCA (Software Composition Analysis)
+  sca: true
+  
+  # Language-specific settings
+  languages:
+    python:
+      # Scan Python files
+      enabled: true
+      # Include patterns
+      include:
+        - "**/*.py"
+      # Exclude patterns
+      exclude:
+        - "tests/**"
+        - "venv/**"
+        - "__pycache__/**" 

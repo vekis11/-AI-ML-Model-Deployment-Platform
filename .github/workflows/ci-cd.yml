@@ -1,0 +1,396 @@
+name: CI/CD Pipeline with Snyk, Docker Hub, and Kind
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+
+env:
+  DOCKER_IMAGE: ml-platform-inference
+  DOCKER_TAG: latest
+  KIND_CLUSTER_NAME: ml-platform-cluster
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  security-scan:
+    name: Security Scan with Snyk
+    runs-on: ubuntu-latest
+    outputs:
+      snyk-result: ${{ steps.snyk-security.outputs.result }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.8'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Run Snyk to check for vulnerabilities
+      id: snyk-security
+      uses: snyk/actions/python@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high --json-file-output=snyk-report.json
+      continue-on-error: true
+      
+    - name: Upload Snyk results to GitHub Code Scanning
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: snyk-report.json
+        
+    - name: Run additional security scans
+      run: |
+        # Install security tools
+        pip install bandit safety semgrep
+        
+        # Bandit security scan
+        bandit -r src/ -f json -o bandit-report.json || true
+        
+        # Safety dependency check
+        safety check --json --output safety-report.json || true
+        
+        # Semgrep static analysis
+        semgrep scan --config=auto --json --output semgrep-report.json src/ || true
+        
+    - name: Generate security summary
+      run: |
+        python -c "
+        import json
+        import os
+        
+        security_issues = []
+        
+        # Check Snyk results
+        if os.path.exists('snyk-report.json'):
+            with open('snyk-report.json', 'r') as f:
+                snyk_data = json.load(f)
+                for run in snyk_data.get('runs', []):
+                    for result in run.get('results', []):
+                        security_issues.append({
+                            'tool': 'Snyk',
+                            'severity': result.get('level', 'UNKNOWN'),
+                            'message': result.get('message', {}).get('text', ''),
+                            'file': result.get('locations', [{}])[0].get('physicalLocation', {}).get('artifactLocation', {}).get('uri', ''),
+                            'line': result.get('locations', [{}])[0].get('physicalLocation', {}).get('region', {}).get('startLine', 'N/A')
+                        })
+        
+        # Check Bandit results
+        if os.path.exists('bandit-report.json'):
+            with open('bandit-report.json', 'r') as f:
+                bandit_data = json.load(f)
+                for issue in bandit_data.get('results', []):
+                    security_issues.append({
+                        'tool': 'Bandit',
+                        'severity': issue.get('issue_severity', 'UNKNOWN'),
+                        'message': issue.get('issue_text', ''),
+                        'file': issue.get('filename', ''),
+                        'line': issue.get('line_number', '')
+                    })
+        
+        # Check Safety results
+        if os.path.exists('safety-report.json'):
+            with open('safety-report.json', 'r') as f:
+                safety_data = json.load(f)
+                for issue in safety_data:
+                    security_issues.append({
+                        'tool': 'Safety',
+                        'severity': 'HIGH',
+                        'message': f'Vulnerable package: {issue.get(\"package\", \"\")}',
+                        'file': 'requirements.txt',
+                        'line': 'N/A'
+                    })
+        
+        # Generate summary
+        high_issues = [i for i in security_issues if i['severity'] == 'HIGH']
+        medium_issues = [i for i in security_issues if i['severity'] == 'MEDIUM']
+        low_issues = [i for i in security_issues if i['severity'] == 'LOW']
+        
+        summary = {
+            'total_issues': len(security_issues),
+            'high_issues': len(high_issues),
+            'medium_issues': len(medium_issues),
+            'low_issues': len(low_issues),
+            'issues': security_issues
+        }
+        
+        with open('security-summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f'Security scan complete: {len(security_issues)} issues found')
+        print(f'High: {len(high_issues)}, Medium: {len(medium_issues)}, Low: {len(low_issues)}')
+        
+        # Set output for next job
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'security-issues={len(security_issues)}\\n')
+            f.write(f'high-issues={len(high_issues)}\\n')
+        "
+        
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          snyk-report.json
+          bandit-report.json
+          safety-report.json
+          semgrep-report.json
+          security-summary.json
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: security-scan
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.8'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov
+        
+    - name: Run unit tests
+      run: |
+        python -m pytest tests/ --cov=src --cov-report=xml --cov-report=html --junitxml=test-results.xml
+        
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results
+        path: |
+          test-results.xml
+          htmlcov/
+          coverage.xml
+
+  build-and-push:
+    name: Build and Push to Docker Hub
+    runs-on: ubuntu-latest
+    needs: [security-scan, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.meta.outputs.tags }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  setup-kind:
+    name: Setup Kind Cluster
+    runs-on: ubuntu-latest
+    needs: [security-scan, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Kind
+      uses: helm/kind-action@v1.7.0
+      with:
+        node_image: kindest/node:v1.27.3
+        cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+        
+    - name: Install NGINX Ingress Controller
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+        kubectl wait --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=90s
+          
+    - name: Install cert-manager
+      run: |
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.yaml
+        kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager
+        
+    - name: Create namespace
+      run: |
+        kubectl create namespace ml-platform --dry-run=client -o yaml | kubectl apply -f -
+        
+    - name: Setup kubectl context
+      run: |
+        kubectl config set-context --current --namespace=ml-platform
+
+  deploy:
+    name: Deploy to Kind
+    runs-on: ubuntu-latest
+    needs: [build-and-push, setup-kind]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Kind
+      uses: helm/kind-action@v1.7.0
+      with:
+        node_image: kindest/node:v1.27.3
+        cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+        
+    - name: Setup kubectl context
+      run: |
+        kubectl config set-context --current --namespace=ml-platform
+        
+    - name: Deploy application
+      run: |
+        # Update image tag in deployment
+        sed -i "s|mlplatformacr.azurecr.io/ml-model-inference:latest|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" infrastructure/kubernetes/deployment.yaml
+        
+        # Apply Kubernetes manifests
+        kubectl apply -f infrastructure/kubernetes/deployment.yaml
+        kubectl apply -f infrastructure/kubernetes/service.yaml
+        kubectl apply -f infrastructure/kubernetes/ingress.yaml
+        
+        # Wait for deployment to be ready
+        kubectl wait --for=condition=available --timeout=300s deployment/ml-model-inference
+        
+    - name: Verify deployment
+      run: |
+        # Check if pods are running
+        kubectl get pods
+        kubectl get services
+        kubectl get ingress
+        
+        # Test the application
+        kubectl port-forward service/ml-inference-service 8080:80 &
+        sleep 10
+        
+        # Health check
+        curl -f http://localhost:8080/health || exit 1
+        
+        # Model info endpoint
+        curl -f http://localhost:8080/model/info || exit 1
+        
+    - name: Run integration tests
+      run: |
+        # Install test dependencies
+        pip install pytest requests
+        
+        # Run integration tests
+        python -m pytest tests/integration/ --service-url=http://localhost:8080 || true
+
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [security-scan, test, deploy]
+    if: always()
+    
+    steps:
+    - name: Download security reports
+      uses: actions/download-artifact@v3
+      with:
+        name: security-reports
+        
+    - name: Download test results
+      uses: actions/download-artifact@v3
+      with:
+        name: test-results
+        
+    - name: Generate notification
+      run: |
+        # Read security summary
+        if [ -f "security-summary.json" ]; then
+          SECURITY_ISSUES=$(python -c "import json; print(json.load(open('security-summary.json'))['total_issues'])")
+          HIGH_ISSUES=$(python -c "import json; print(json.load(open('security-summary.json'))['high_issues'])")
+        else
+          SECURITY_ISSUES=0
+          HIGH_ISSUES=0
+        fi
+        
+        # Check test results
+        if [ -f "test-results.xml" ]; then
+          TEST_STATUS="✅ Tests passed"
+        else
+          TEST_STATUS="❌ Tests failed"
+        fi
+        
+        # Check deployment status
+        if [ "${{ needs.deploy.result }}" == "success" ]; then
+          DEPLOY_STATUS="✅ Deployed successfully"
+        else
+          DEPLOY_STATUS="❌ Deployment failed"
+        fi
+        
+        echo "## CI/CD Pipeline Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Security Scan" >> $GITHUB_STEP_SUMMARY
+        echo "- Total issues: $SECURITY_ISSUES" >> $GITHUB_STEP_SUMMARY
+        echo "- High priority issues: $HIGH_ISSUES" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "- Status: $TEST_STATUS" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Deployment" >> $GITHUB_STEP_SUMMARY
+        echo "- Status: $DEPLOY_STATUS" >> $GITHUB_STEP_SUMMARY
+        echo "- Environment: Kind Cluster" >> $GITHUB_STEP_SUMMARY
+        echo "- Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY 

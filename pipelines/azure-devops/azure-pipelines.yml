@@ -1,0 +1,302 @@
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    include:
+    - src/*
+    - pipelines/*
+    - infrastructure/*
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+
+variables:
+  # Azure resources
+  resourceGroupName: 'ml-platform-rg'
+  location: 'East US'
+  workspaceName: 'ml-platform-workspace'
+  containerRegistryName: 'mlplatformacr'
+  aksClusterName: 'ml-platform-aks'
+  
+  # Application
+  imageRepository: 'ml-model-inference'
+  containerRegistry: 'mlplatformacr.azurecr.io'
+  dockerfilePath: '**/Dockerfile'
+  tag: '$(Build.BuildId)'
+  
+  # Python
+  pythonVersion: '3.8'
+
+stages:
+- stage: Build
+  displayName: 'Build and Test'
+  jobs:
+  - job: Build
+    displayName: 'Build and Test'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+        addToPath: true
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov bandit safety semgrep
+      displayName: 'Install dependencies'
+    
+    - script: |
+        python -m pytest tests/ --cov=src --cov-report=xml --cov-report=html
+      displayName: 'Run unit tests'
+    
+    - script: |
+        bandit -r src/ -f json -o bandit-report.json
+      displayName: 'Run security scan (Bandit)'
+    
+    - script: |
+        safety check --json --output safety-report.json
+      displayName: 'Check dependencies for vulnerabilities'
+    
+    - script: |
+        semgrep scan --config=auto --json --output semgrep-report.json src/
+      displayName: 'Run static analysis (Semgrep)'
+    
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/test-results.xml'
+        mergeTestResults: true
+        testRunTitle: 'Python $(Agent.JobName)'
+      condition: succeededOrFailed()
+    
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '**/coverage.xml'
+        reportDirectory: '**/htmlcov'
+      condition: succeededOrFailed()
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'drop'
+      condition: succeededOrFailed()
+
+- stage: Security
+  displayName: 'Security Testing'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: SecurityScan
+    displayName: 'Security Analysis'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - download: current
+      artifact: drop
+    
+    - script: |
+        # Install security tools
+        pip install bandit safety semgrep trivy
+        
+        # Run comprehensive security scan
+        echo "Running comprehensive security scan..."
+        
+        # Bandit security scan
+        bandit -r src/ -f json -o bandit-report.json || true
+        
+        # Safety dependency check
+        safety check --json --output safety-report.json || true
+        
+        # Semgrep static analysis
+        semgrep scan --config=auto --json --output semgrep-report.json src/ || true
+        
+        # Trivy container scan (if Dockerfile exists)
+        if [ -f "Dockerfile" ]; then
+          trivy image --format json --output trivy-report.json $(Build.Repository.Name):$(Build.BuildId) || true
+        fi
+        
+        # Generate security summary
+        python -c "
+        import json
+        import os
+        
+        security_issues = []
+        
+        # Check Bandit results
+        if os.path.exists('bandit-report.json'):
+            with open('bandit-report.json', 'r') as f:
+                bandit_data = json.load(f)
+                for issue in bandit_data.get('results', []):
+                    security_issues.append({
+                        'tool': 'Bandit',
+                        'severity': issue.get('issue_severity', 'UNKNOWN'),
+                        'message': issue.get('issue_text', ''),
+                        'file': issue.get('filename', ''),
+                        'line': issue.get('line_number', '')
+                    })
+        
+        # Check Safety results
+        if os.path.exists('safety-report.json'):
+            with open('safety-report.json', 'r') as f:
+                safety_data = json.load(f)
+                for issue in safety_data:
+                    security_issues.append({
+                        'tool': 'Safety',
+                        'severity': 'HIGH',
+                        'message': f'Vulnerable package: {issue.get(\"package\", \"\")}',
+                        'file': 'requirements.txt',
+                        'line': 'N/A'
+                    })
+        
+        # Generate summary
+        high_issues = [i for i in security_issues if i['severity'] == 'HIGH']
+        medium_issues = [i for i in security_issues if i['severity'] == 'MEDIUM']
+        low_issues = [i for i in security_issues if i['severity'] == 'LOW']
+        
+        summary = {
+            'total_issues': len(security_issues),
+            'high_issues': len(high_issues),
+            'medium_issues': len(medium_issues),
+            'low_issues': len(low_issues),
+            'issues': security_issues
+        }
+        
+        with open('security-summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f'Security scan complete: {len(security_issues)} issues found')
+        print(f'High: {len(high_issues)}, Medium: {len(medium_issues)}, Low: {len(low_issues)}')
+        "
+      displayName: 'Run comprehensive security scan'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'security-summary.json'
+        artifactName: 'security-report'
+      condition: always()
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '*.json'
+        artifactName: 'security-details'
+      condition: always()
+
+- stage: BuildImage
+  displayName: 'Build Container Image'
+  dependsOn: Security
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: BuildImage
+    displayName: 'Build and Push Image'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: Docker@2
+      inputs:
+        containerRegistry: 'Azure Container Registry'
+        repository: '$(imageRepository)'
+        command: 'buildAndPush'
+        Dockerfile: '$(dockerfilePath)'
+        tags: |
+          $(tag)
+          latest
+      displayName: 'Build and push Docker image'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'docker-image'
+
+- stage: Deploy
+  displayName: 'Deploy to AKS'
+  dependsOn: BuildImage
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: Deploy
+    displayName: 'Deploy to AKS'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'aks-service-connection'
+              manifests: 'infrastructure/kubernetes/deployment.yaml'
+              containers: '$(containerRegistry)/$(imageRepository):$(tag)'
+            displayName: 'Deploy to AKS'
+          
+          - task: KubernetesManifest@0
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'aks-service-connection'
+              manifests: 'infrastructure/kubernetes/service.yaml'
+            displayName: 'Deploy service'
+          
+          - task: KubernetesManifest@0
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'aks-service-connection'
+              manifests: 'infrastructure/kubernetes/ingress.yaml'
+            displayName: 'Deploy ingress'
+
+- stage: Test
+  displayName: 'Integration Tests'
+  dependsOn: Deploy
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: IntegrationTest
+    displayName: 'Run Integration Tests'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - script: |
+        # Wait for deployment to be ready
+        sleep 60
+        
+        # Get service URL
+        SERVICE_URL=$(kubectl get service ml-inference-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        
+        # Run integration tests
+        python -m pytest tests/integration/ --service-url=http://$SERVICE_URL
+      displayName: 'Run integration tests'
+    
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/test-results.xml'
+        mergeTestResults: true
+        testRunTitle: 'Integration Tests'
+      condition: succeededOrFailed()
+
+- stage: Monitor
+  displayName: 'Monitoring Setup'
+  dependsOn: Test
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: SetupMonitoring
+    displayName: 'Setup Monitoring'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - script: |
+        # Deploy monitoring components
+        kubectl apply -f infrastructure/kubernetes/monitoring/
+        
+        # Setup alerts
+        kubectl apply -f infrastructure/kubernetes/alerts/
+      displayName: 'Setup monitoring and alerts' 

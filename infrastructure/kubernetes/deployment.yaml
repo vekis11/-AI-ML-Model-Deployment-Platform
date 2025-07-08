@@ -1,0 +1,168 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-model-inference
+  labels:
+    app: ml-model-inference
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ml-model-inference
+  template:
+    metadata:
+      labels:
+        app: ml-model-inference
+        version: v1
+    spec:
+      containers:
+      - name: ml-inference
+        image: mlplatformacr.azurecr.io/ml-model-inference:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: MODEL_PATH
+          value: "/models/final_model.h5"
+        - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: app-insights-secret
+              key: connection-string
+        - name: AZURE_STORAGE_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: storage-secret
+              key: connection-string
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-inference-service
+  labels:
+    app: ml-model-inference
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: ml-model-inference
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ml-inference-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ml-model-inference
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ml-inference-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - ml-inference.example.com
+    secretName: ml-inference-tls
+  rules:
+  - host: ml-inference.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ml-inference-service
+            port:
+              number: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-inference-config
+data:
+  model_config.yaml: |
+    model_type: tensorflow
+    input_shape: [224, 224, 3]
+    num_classes: 10
+    batch_size: 32
+    learning_rate: 0.001
+    optimizer: adam
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-insights-secret
+type: Opaque
+data:
+  connection-string: <base64-encoded-connection-string>
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: storage-secret
+type: Opaque
+data:
+  connection-string: <base64-encoded-storage-connection-string> 
