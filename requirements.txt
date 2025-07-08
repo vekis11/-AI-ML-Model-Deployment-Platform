@@ -17,7 +17,7 @@ opencv-python==4.8.0.76
 # Web Framework
 fastapi==0.103.1
 uvicorn==0.23.2
-pydantic==2.3.0
+pydantic==2.0.3
 
 # Monitoring & Logging
 applicationinsights==0.11.10
@@ -34,9 +34,9 @@ pytest-asyncio==0.21.1
 
 # Infrastructure
 kubernetes==27.2.0
-azure-identity==1.14.0
-azure-keyvault-secrets==4.7.0
-azure-storage-blob==12.17.0
+azure-identity==1.13.0
+azure-keyvault-secrets==4.6.0
+azure-storage-blob==12.13.0
 
 # Utilities
 python-dotenv==1.0.0
